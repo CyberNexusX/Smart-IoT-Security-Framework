@@ -1,0 +1,26 @@
+{
+  "device": {
+    "device_id": "iot-sensor-001",
+    "device_type": "environmental-sensor",
+    "location": "building-a-room-101"
+  },
+  "aws": {
+    "endpoint": "your-aws-iot-endpoint.amazonaws.com",
+    "cert_path": "/path/to/certificate.pem.crt",
+    "key_path": "/path/to/private.pem.key",
+    "root_ca_path": "/path/to/AmazonRootCA1.pem",
+    "client_id": ""
+  },
+  "mqtt": {
+    "local_broker": "localhost",
+    "local_port": 1883,
+    "use_local": true
+  },
+  "security": {
+    "anomaly_threshold": 0.85,
+    "history_size": 100,
+    "blocked_ips": [],
+    "training_mode": false,
+    "log_level": "INFO"
+  }
+}
