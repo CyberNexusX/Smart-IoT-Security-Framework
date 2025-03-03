@@ -1,0 +1,346 @@
+# Smart IoT Security Framework
+# A lightweight security protocol for IoT devices using AI-driven anomaly detection
+
+import json
+import time
+import uuid
+import numpy as np
+import paho.mqtt.client as mqtt
+from datetime import datetime
+from awscrt import mqtt as aws_mqtt
+from awsiot import mqtt_connection_builder
+from sklearn.ensemble import IsolationForest
+from collections import deque
+
+class IoTSecurityMonitor:
+    def __init__(self, device_id, aws_endpoint, cert_path, key_path, root_ca_path, 
+                 client_id=None, anomaly_threshold=0.85, history_size=100):
+        """
+        Initialize the IoT Security Monitor.
+        
+        Args:
+            device_id (str): Unique identifier for the IoT device
+            aws_endpoint (str): AWS IoT Core endpoint
+            cert_path (str): Path to device certificate
+            key_path (str): Path to private key
+            root_ca_path (str): Path to root CA certificate
+            client_id (str, optional): MQTT client ID. Defaults to a UUID.
+            anomaly_threshold (float, optional): Threshold for anomaly detection. Defaults to 0.85.
+            history_size (int, optional): Size of the history buffer for behavior analysis. Defaults to 100.
+        """
+        self.device_id = device_id
+        self.client_id = client_id or f"iot-device-{uuid.uuid4()}"
+        self.anomaly_threshold = anomaly_threshold
+        
+        # Initialize connection to AWS IoT Core
+        self.aws_endpoint = aws_endpoint
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.root_ca_path = root_ca_path
+        self.aws_connection = self._setup_aws_connection()
+        
+        # Local MQTT broker for edge processing
+        self.local_mqtt_client = mqtt.Client()
+        self.local_mqtt_client.on_connect = self._on_local_connect
+        self.local_mqtt_client.on_message = self._on_local_message
+        
+        # Anomaly detection model
+        self.model = IsolationForest(contamination=0.05, random_state=42)
+        self.is_model_trained = False
+        
+        # Device behavior history
+        self.behavior_history = deque(maxlen=history_size)
+        
+        # Security state
+        self.security_state = {
+            "status": "normal",
+            "last_anomaly": None,
+            "blocked_ips": set(),
+            "auth_failures": {},
+            "access_log": deque(maxlen=100)
+        }
+        
+        # Topics
+        self.anomaly_topic = f"devices/{self.device_id}/security/anomalies"
+        self.telemetry_topic = f"devices/{self.device_id}/telemetry"
+        self.command_topic = f"devices/{self.device_id}/commands"
+        self.status_topic = f"devices/{self.device_id}/status"
+
+    def _setup_aws_connection(self):
+        """Set up the AWS IoT Core MQTT connection."""
+        return mqtt_connection_builder.mtls_from_path(
+            endpoint=self.aws_endpoint,
+            cert_filepath=self.cert_path,
+            pri_key_filepath=self.key_path,
+            ca_filepath=self.root_ca_path,
+            client_id=self.client_id,
+            clean_session=True,
+            keep_alive_secs=30
+        )
+    
+    def _on_local_connect(self, client, userdata, flags, rc):
+        """Callback for when the local MQTT client connects."""
+        print(f"Connected to local MQTT broker with result code: {rc}")
+        client.subscribe(f"local/{self.device_id}/#")
+        
+    def _on_local_message(self, client, userdata, msg):
+        """Callback for when a message is received on the local MQTT broker."""
+        try:
+            payload = json.loads(msg.payload.decode())
+            topic = msg.topic
+            
+            # Process local messages for security analysis
+            if "command" in topic:
+                self._analyze_command(payload, is_local=True)
+            elif "data" in topic:
+                self._analyze_telemetry(payload, is_local=True)
+        except Exception as e:
+            self._log_security_event("error", f"Error processing local message: {str(e)}")
+    
+    def connect(self):
+        """Connect to both AWS IoT Core and local MQTT broker."""
+        # Connect to AWS IoT Core
+        connect_future = self.aws_connection.connect()
+        connect_future.result()
+        print(f"Connected to AWS IoT Core as {self.client_id}")
+        
+        # Subscribe to AWS topics
+        self.aws_connection.subscribe(
+            topic=self.command_topic,
+            qos=aws_mqtt.QoS.AT_LEAST_ONCE,
+            callback=self._handle_aws_command
+        )
+        
+        # Connect to local MQTT broker
+        try:
+            self.local_mqtt_client.connect("localhost", 1883, 60)
+            self.local_mqtt_client.loop_start()
+        except Exception as e:
+            print(f"Error connecting to local MQTT broker: {str(e)}")
+            
+        # Publish initial status
+        self._publish_status()
+    
+    def _handle_aws_command(self, topic, payload, **kwargs):
+        """Handle commands received from AWS IoT Core."""
+        try:
+            message = json.loads(payload.decode())
+            source_ip = message.get("source_ip", "unknown")
+            command = message.get("command")
+            
+            # Log the command
+            self._log_security_event("command", f"Received command {command} from {source_ip}")
+            
+            # Analyze the command for security anomalies
+            anomaly_detected = self._analyze_command(message)
+            
+            if anomaly_detected:
+                # If anomaly detected, don't execute the command
+                self._publish_anomaly(command, source_ip, "Suspicious command pattern detected")
+                return
+            
+            # Execute the validated command
+            self._execute_command(command, message)
+            
+        except Exception as e:
+            self._log_security_event("error", f"Error handling command: {str(e)}")
+    
+    def _analyze_command(self, message, is_local=False):
+        """
+        Analyze a command for security anomalies.
+        
+        Returns:
+            bool: True if anomaly detected, False otherwise
+        """
+        command = message.get("command")
+        source = message.get("source_ip", "local" if is_local else "unknown")
+        timestamp = message.get("timestamp", time.time())
+        
+        # Check if source is blocked
+        if source in self.security_state["blocked_ips"]:
+            self._log_security_event("blocked", f"Blocked command from blacklisted source: {source}")
+            return True
+        
+        # Feature extraction for anomaly detection
+        features = self._extract_command_features(command, source, timestamp)
+        
+        # Add to behavior history
+        self.behavior_history.append(features)
+        
+        # Train model if we have enough data and it's not yet trained
+        if len(self.behavior_history) >= 50 and not self.is_model_trained:
+            self._train_model()
+        
+        # Detect anomalies if model is trained
+        if self.is_model_trained:
+            is_anomaly = self._detect_anomaly(features)
+            if is_anomaly:
+                self._log_security_event("anomaly", f"Command anomaly detected from {source}: {command}")
+                return True
+        
+        return False
+    
+    def _extract_command_features(self, command, source, timestamp):
+        """Extract features from a command for anomaly detection."""
+        # This is a simplified feature extraction - in production, this would be more sophisticated
+        hour_of_day = datetime.fromtimestamp(timestamp).hour
+        
+        # Simple features for demonstration
+        features = [
+            hour_of_day / 24.0,  # Normalize hour of day
+            1.0 if "set" in command else 0.0,
+            1.0 if "get" in command else 0.0,
+            1.0 if "restart" in command else 0.0,
+            1.0 if "update" in command else 0.0,
+            1.0 if source == "local" else 0.0
+        ]
+        return features
+    
+    def _train_model(self):
+        """Train the anomaly detection model on collected behavior history."""
+        print("Training anomaly detection model...")
+        X = np.array(list(self.behavior_history))
+        self.model.fit(X)
+        self.is_model_trained = True
+        print("Anomaly detection model trained successfully")
+    
+    def _detect_anomaly(self, features):
+        """
+        Detect if a set of features represents an anomaly.
+        
+        Returns:
+            bool: True if anomaly detected, False otherwise
+        """
+        features_array = np.array([features])
+        scores = self.model.decision_function(features_array)
+        # Higher score means less anomalous
+        return scores[0] < -self.anomaly_threshold
+    
+    def _analyze_telemetry(self, data, is_local=False):
+        """Analyze telemetry data for security anomalies."""
+        # Similar to command analysis but for telemetry data
+        # Implementation would depend on the specific telemetry data structure
+        pass
+    
+    def _execute_command(self, command, message):
+        """Execute a validated command."""
+        # This would contain the logic to execute different commands
+        print(f"Executing command: {command}")
+        
+        # Update status after command execution
+        self._publish_status()
+    
+    def _publish_anomaly(self, command, source, reason):
+        """Publish an anomaly event to AWS IoT Core."""
+        anomaly_data = {
+            "device_id": self.device_id,
+            "timestamp": time.time(),
+            "command": command,
+            "source": source,
+            "reason": reason
+        }
+        
+        # Update security state
+        self.security_state["status"] = "alert"
+        self.security_state["last_anomaly"] = anomaly_data
+        
+        # Publish to AWS IoT Core
+        self.aws_connection.publish(
+            topic=self.anomaly_topic,
+            payload=json.dumps(anomaly_data),
+            qos=aws_mqtt.QoS.AT_LEAST_ONCE
+        )
+        
+        # Log locally
+        self._log_security_event("alert", f"Published anomaly alert: {reason}")
+    
+    def _publish_status(self):
+        """Publish current device status to AWS IoT Core."""
+        status_data = {
+            "device_id": self.device_id,
+            "timestamp": time.time(),
+            "security_status": self.security_state["status"],
+            "model_trained": self.is_model_trained
+        }
+        
+        self.aws_connection.publish(
+            topic=self.status_topic,
+            payload=json.dumps(status_data),
+            qos=aws_mqtt.QoS.AT_LEAST_ONCE
+        )
+    
+    def _log_security_event(self, event_type, message):
+        """Log a security event locally."""
+        event = {
+            "timestamp": time.time(),
+            "type": event_type,
+            "message": message
+        }
+        self.security_state["access_log"].append(event)
+        print(f"SECURITY EVENT [{event_type}]: {message}")
+    
+    def update_security_policy(self, policy_update):
+        """Update the security policy based on external input."""
+        if "blocked_ips" in policy_update:
+            for ip in policy_update["blocked_ips"]:
+                self.security_state["blocked_ips"].add(ip)
+        
+        if "anomaly_threshold" in policy_update:
+            self.anomaly_threshold = policy_update["anomaly_threshold"]
+        
+        self._log_security_event("policy", "Security policy updated")
+    
+    def disconnect(self):
+        """Disconnect from AWS IoT Core and local MQTT broker."""
+        # Disconnect from AWS IoT Core
+        disconnect_future = self.aws_connection.disconnect()
+        disconnect_future.result()
+        
+        # Disconnect from local MQTT broker
+        self.local_mqtt_client.loop_stop()
+        self.local_mqtt_client.disconnect()
+        
+        print(f"Disconnected {self.client_id} from all services")
+
+
+# Example deployment script
+def deploy_security_framework():
+    """Deploy the IoT Security Framework to a device."""
+    
+    # Configuration
+    config = {
+        "device_id": "iot-sensor-001",
+        "aws_endpoint": "your-aws-iot-endpoint.amazonaws.com",
+        "cert_path": "/path/to/certificate.pem.crt",
+        "key_path": "/path/to/private.pem.key",
+        "root_ca_path": "/path/to/AmazonRootCA1.pem",
+        "anomaly_threshold": 0.8
+    }
+    
+    # Initialize security monitor
+    security_monitor = IoTSecurityMonitor(
+        device_id=config["device_id"],
+        aws_endpoint=config["aws_endpoint"],
+        cert_path=config["cert_path"],
+        key_path=config["key_path"],
+        root_ca_path=config["root_ca_path"],
+        anomaly_threshold=config["anomaly_threshold"]
+    )
+    
+    try:
+        # Connect to AWS IoT Core and local MQTT
+        security_monitor.connect()
+        
+        # Main processing loop
+        while True:
+            # This would process local data, update models, etc.
+            time.sleep(10)
+            
+    except KeyboardInterrupt:
+        print("Shutting down security monitor...")
+    finally:
+        security_monitor.disconnect()
+
+
+if __name__ == "__main__":
+    deploy_security_framework()
